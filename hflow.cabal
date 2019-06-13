@@ -1,0 +1,51 @@
+cabal-version: 2.4
+name:
+  hflow
+version:
+  0.1
+synopsis:
+  parse network flow in haskell
+description:
+  parse network flow in haskell
+homepage:
+  https://github.com/chessai/hflow
+bug-reports:
+  https://github.com/chessai/hflow/issues
+license:
+  BSD-3-Clause
+license-file:
+  LICENSE
+author:
+  chessai
+maintainer:
+  chessai <chessai1996@gmail.com>
+copyright:
+  © 2019 chessai
+category:
+  Data, Parsing, Network, Web
+build-type:
+  Simple
+extra-doc-files:
+    README.md
+  , CHANGELOG.md
+tested-with:
+  GHC == 8.6.3
+
+library
+  hs-source-dirs:
+    src
+  exposed-modules:
+    Hflow
+  build-depends:
+    , base ^>= 4.12.0.0
+  ghc-options:
+    -Wall
+    -O2
+  default-language:
+    Haskell2010
+
+source-repository head
+  type:
+    git
+  location:
+    https://github.com/chessai/hflow.git
