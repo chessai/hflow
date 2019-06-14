@@ -1,0 +1,5 @@
+packages: .
+source-repository-package
+  type: git
+  location: https://github.com/haskell-primitive/primitive-unaligned
+  tag: b36db52e95612b8c0f2955a9a17763c9a18d36ce
