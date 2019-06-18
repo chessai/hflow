@@ -43,8 +43,10 @@ library
     , byteslice >= 0.1 && < 0.2
     , contiguous >= 0.4.0.1 && < 0.5
     , ip >= 1.5 && < 1.6
+    , mtl >= 2.2 && < 2.3
     , primitive >= 0.7 && < 0.8
     , primitive-unaligned >= 0.1 && < 0.2
+    , transformers >= 0.5 && < 0.6
   ghc-options:
     -Wall
     -O2

@@ -2,20 +2,28 @@
         BangPatterns
       , DataKinds
       , DerivingStrategies
+      , FlexibleInstances
       , GeneralizedNewtypeDeriving
+      , MultiParamTypeClasses
+      , NamedFieldPuns
       , PolyKinds
+      , RankNTypes
       , ScopedTypeVariables
       , StandaloneDeriving
       , TypeApplications
       , UnboxedTuples
+      , ViewPatterns
   #-}
 
 {-# options_ghc -fno-warn-orphans #-}
 
 module Hflow.NetFlow5
-  ( --parse
+  ( packet
+  , runParser
+  , Parser(..)
+  , get
 
-    Packet(..)
+  , Packet(..)
   , Header(..)
   , Record(..)
   , Count(..)
@@ -50,68 +58,97 @@ module Hflow.NetFlow5
 
 import Prelude hiding (read)
 
+import Control.Monad.ST
+import Control.Monad.Except
 import Data.Bytes.Types (MutableBytes(..))
 import Data.Coerce (coerce)
 import Data.Primitive
 import Data.Primitive.ByteArray.Unaligned
-import Control.Monad.Primitive (PrimMonad(..))
 import Data.Word
 import Net.Types (IPv4(..))
 import System.ByteOrder
 
+import qualified GHC.Exts as Exts
+
 -------------------------- Helpers --------------------------
 
+data ParseError = ParseError
 {-
-parse :: PrimMonad m
-  => MutableBytes (PrimState m)
-  -> m (Either String Packet)
-parse marr@(MutableBytes mbarr _ _) = do
-  let !sz = sizeofByteArray mbarr
-  if isBadBacketSize sz
-    then do
-      h <- runParser header marr
-      pure undefined
-    else pure
-      $ Left
-      $ "packet size was not 24 + 48m, where m <- [1..]."
-
-isBadPacketSize :: Int -> Bool
-isBadPacketSize sz = (sz - headerSize) `mod` recordSize == 0
-
-isBadRecordArray :: Count -> Int -> Bool
-isBadRecordArray (Count cnt) szRecs =
-  fromIntegral cnt == szRecs `div` recordSize
+  = InitialOffsetNotZero -- ^ The input buffer did not have an initial
+                         --   offset of zero.
+  | InitialLengthNotCorrect -- ^ The input buffer's true length was
+                            --   modified to not be its original length.
+--  | PacketSizeNot2448m -- ^ packet size was not congruent to (m - 24) mod 48
+  | CountIsIncorrect -- ^ The number of flows that the header prescribed
+                     --   was incorrect.
+  | PacketButNoFlows -- ^ A NetFlow v5 'Packet' was received, but there
+                     --   were no flows.
+  | SmallerThanHeader
 -}
 
-runParser :: PrimMonad m
-  => MutableBytes (PrimState m)
-  -> Parser m a
-  -> m (MutableBytes (PrimState m), a)
+packet :: Parser Packet
+packet = do
+  h@Header{headerCount} <- header
+  r <- records headerCount
+  pure (Packet h r)
+
+-- | Returns leftovers and potentially a value.
+runParser :: ()
+  => MutableBytes s
+  -> Parser a
+  -> ST s (MutableBytes s, Either ParseError a)
 runParser marr (Parser p) = p marr
 
 data Packet = Packet
   !Header
   !(Array Record)
 
-coerceFixed :: forall m a b. Functor m => m (Fixed b a) -> m a
-coerceFixed = fmap coerce
-{-# inline coerceFixed #-}
-
-read :: forall m a. (PrimMonad m, Bytes a, PrimUnaligned a)
+read :: forall a s. (Bytes a, PrimUnaligned a)
   => Int
-  -> MutableBytes (PrimState m)
-  -> m a
-read ix (MutableBytes marr o l) = coerceFixed
-  (readUnalignedByteArray marr (o + ix) :: m (Fixed 'BigEndian a))
+  -> MutableBytes s
+  -> ST s a
+read ix (MutableBytes marr o _) = coerce
+  (readUnalignedByteArray marr (o + ix) :: ST s (Fixed 'BigEndian a))
 {-# inline read #-}
 
 shift :: Int -> MutableBytes s -> MutableBytes s
-shift !parsedLen (MutableBytes m o l) = MutableBytes m (o + parsedLen) l
+shift !parsedLen (MutableBytes m o l) = MutableBytes m (o + parsedLen) (l - parsedLen)
 
-type Reader m a = MutableBytes (PrimState m) -> m a
+-- | A 'Reader' is assumed to not be able to fail.
+--   This is an internal invariant.
+type Reader s a = MutableBytes s -> ST s a
 
-newtype Parser m a = Parser
-  (MutableBytes (PrimState m) -> m (MutableBytes (PrimState m), a))
+newtype Parser a = Parser
+  (forall s. MutableBytes s -> ST s (MutableBytes s, Either ParseError a))
+-- | Get the offset and length information out of the parser.
+get :: Parser (Int, Int)
+get = Parser $ \marr@(MutableBytes _ off len) -> do
+  pure (marr, Right (off, len))
+
+instance Functor Parser where
+  fmap f (Parser p) = Parser $ \s -> do
+    (s', e) <- p s
+    pure (s', fmap f e)
+
+instance Applicative Parser where
+  pure x = Parser $ \s -> pure (s, Right x)
+  (<*>) = ap
+
+instance Monad Parser where
+  --(>>=) :: Parser a -> (a -> Parser b) -> Parser b
+  (Parser p) >>= k = Parser $ \s -> do
+    (s', e) <- p s
+    case e of
+      Left err -> pure (s', Left err)
+      Right a -> case k a of Parser p' -> p' s'
+
+instance MonadError ParseError Parser where
+  throwError e = Parser $ \m -> pure (m, Left e)
+  catchError (Parser p) f = Parser $ \s -> do
+    (s', e) <- p s
+    case e of
+      Left err -> case f err of (Parser p') -> p' s'
+      Right _ -> pure (s', e)
 
 -------------------------- Header Types --------------------------
 
@@ -188,48 +225,60 @@ newtype SamplingInterval = SamplingInterval { getSamplingInterval :: Word16 }
 
 -------------------------- Header Readers --------------------------
 
-version :: forall m. (PrimMonad m) => Reader m Version
+version :: Reader s Version
 version marr = do
-  x <- read @m @Word16 0 marr
+  x <- read @Word16 0 marr
   pure $ if x == 5 then Version5 else VersionOther x
 
-count :: forall m. (PrimMonad m) => Reader m Count
-count = read @m @Count 2
+count :: forall s. Reader s Count
+count = read @Count 2
 
-sysUptime :: forall m. (PrimMonad m) => Reader m SysUptime
-sysUptime = read @m @SysUptime 4
+sysUptime :: forall s. Reader s SysUptime
+sysUptime = read @SysUptime 4
 
-unixSecs :: forall m. (PrimMonad m) => Reader m UnixSecs
-unixSecs = read @m @UnixSecs 8
+unixSecs :: forall s. Reader s UnixSecs
+unixSecs = read @UnixSecs 8
 
-unixNSecs :: forall m. (PrimMonad m) => Reader m UnixNSecs
-unixNSecs = read @m @UnixNSecs 12
+unixNSecs :: forall s. Reader s UnixNSecs
+unixNSecs = read @UnixNSecs 12
 
-flowSequence :: forall m. (PrimMonad m) => Reader m FlowSequence
-flowSequence = read @m @FlowSequence 16
+flowSequence :: forall s. Reader s FlowSequence
+flowSequence = read @FlowSequence 16
 
-engineType :: forall m. (PrimMonad m) => Reader m EngineType
-engineType = read @m @EngineType 20
+engineType :: forall s. Reader s EngineType
+engineType = read @EngineType 20
 
-engineId :: forall m. (PrimMonad m) => Reader m EngineId
-engineId = read @m @EngineId 21
+engineId :: forall s. Reader s EngineId
+engineId = read @EngineId 21
 
-samplingInterval :: forall m. (PrimMonad m) => Reader m SamplingInterval
-samplingInterval = read @m @SamplingInterval 22
+samplingInterval :: forall s. Reader s SamplingInterval
+samplingInterval = read @SamplingInterval 22
 
-header :: forall m. PrimMonad m => Parser m Header
-header = Parser $ \marr -> do
-  h <- Header
-    <$> version marr
-    <*> count marr
-    <*> sysUptime marr
-    <*> unixSecs marr
-    <*> unixNSecs marr
-    <*> flowSequence marr
-    <*> engineType marr
-    <*> engineId marr
-    <*> samplingInterval marr
-  pure (shift headerSize marr, h)
+-- | Run a parser, shifting the underlying buffer by a given
+--   ammount.
+parseWithShift :: Int -> (forall s. Reader s a) -> Parser a
+parseWithShift s reader = Parser $ \marr -> do
+  p <- reader marr
+  pure (shift s marr, Right p)
+
+header :: Parser Header
+header = do
+  (_, len) <- get
+  if len < headerSize
+    then throwError ParseError
+    else parseWithShift headerSize headerReader
+
+headerReader :: Reader s Header
+headerReader marr = Header
+  <$> version marr
+  <*> count marr
+  <*> sysUptime marr
+  <*> unixSecs marr
+  <*> unixNSecs marr
+  <*> flowSequence marr
+  <*> engineType marr
+  <*> engineId marr
+  <*> samplingInterval marr
 
 -------------------------- Record Types --------------------------
 
@@ -380,88 +429,96 @@ newtype Pad2 = Pad2 { getPad2 :: Word16 }
   deriving newtype (Show, Read)
   deriving newtype (Prim, PrimUnaligned, Bytes)
 
-srcAddr :: forall m. PrimMonad m => Reader m SrcAddr
-srcAddr = read @m @SrcAddr 0
+srcAddr :: forall s. Reader s SrcAddr
+srcAddr = read @SrcAddr 0
 
-dstAddr :: forall m. PrimMonad m => Reader m DstAddr
-dstAddr = read @m @DstAddr 4
+dstAddr :: forall s. Reader s DstAddr
+dstAddr = read @DstAddr 4
 
-nextHop :: forall m. PrimMonad m => Reader m NextHop
-nextHop = read @m @NextHop 8
+nextHop :: forall s. Reader s NextHop
+nextHop = read @NextHop 8
 
-input :: forall m. PrimMonad m => Reader m Input
-input = read @m @Input 12
+input :: forall s. Reader s Input
+input = read @Input 12
 
-output :: forall m. PrimMonad m => Reader m Output
-output = read @m @Output 14
+output :: forall s. Reader s Output
+output = read @Output 14
 
-dPkts :: forall m. PrimMonad m => Reader m DPkts
-dPkts = read @m @DPkts 16
+dPkts :: forall s. Reader s DPkts
+dPkts = read @DPkts 16
 
-dOctets :: forall m. PrimMonad m => Reader m DOctets
-dOctets = read @m @DOctets 20
+dOctets :: forall s. Reader s DOctets
+dOctets = read @DOctets 20
 
-firstSysUptime :: forall m. PrimMonad m => Reader m FirstSysUptime
-firstSysUptime = read @m @FirstSysUptime 24
+firstSysUptime :: forall s. Reader s FirstSysUptime
+firstSysUptime = read @FirstSysUptime 24
 
-lastSysUptime :: forall m. PrimMonad m => Reader m LastSysUptime
-lastSysUptime = read @m @LastSysUptime 28
+lastSysUptime :: forall s. Reader s LastSysUptime
+lastSysUptime = read @LastSysUptime 28
 
-srcPort :: forall m. PrimMonad m => Reader m SrcPort
-srcPort = read @m @SrcPort 32
+srcPort :: forall s. Reader s SrcPort
+srcPort = read @SrcPort 32
 
-dstPort :: forall m. PrimMonad m => Reader m DstPort
-dstPort = read @m @DstPort 34
+dstPort :: forall s. Reader s DstPort
+dstPort = read @DstPort 34
 
-pad1 :: forall m. PrimMonad m => Reader m Pad1
-pad1 = read @m @Pad1 36
+pad1 :: forall s. Reader s Pad1
+pad1 = read @Pad1 36
 
-tcpFlags :: forall m. PrimMonad m => Reader m TcpFlags
-tcpFlags = read @m @TcpFlags 37
+tcpFlags :: forall s. Reader s TcpFlags
+tcpFlags = read @TcpFlags 37
 
-prot :: forall m. PrimMonad m => Reader m Prot
-prot = read @m @Prot 38
+prot :: forall s. Reader s Prot
+prot = read @Prot 38
 
-tos :: forall m. PrimMonad m => Reader m Tos
-tos = read @m @Tos 39
+tos :: forall s. Reader s Tos
+tos = read @Tos 39
 
-srcAs :: forall m. PrimMonad m => Reader m SrcAs
-srcAs = read @m @SrcAs 40
+srcAs :: forall s. Reader s SrcAs
+srcAs = read @SrcAs 40
 
-dstAs :: forall m. PrimMonad m => Reader m DstAs
-dstAs = read @m @DstAs 42
+dstAs :: forall s. Reader s DstAs
+dstAs = read @DstAs 42
 
-srcMask :: forall m. PrimMonad m => Reader m SrcMask
-srcMask = read @m @SrcMask 44
+srcMask :: forall s. Reader s SrcMask
+srcMask = read @SrcMask 44
 
-dstMask :: forall m. PrimMonad m => Reader m DstMask
-dstMask = read @m @DstMask 45
+dstMask :: forall s. Reader s DstMask
+dstMask = read @DstMask 45
 
-pad2 :: forall m. PrimMonad m => Reader m Pad2
-pad2 = read @m @Pad2 46
+pad2 :: forall s. Reader s Pad2
+pad2 = read @Pad2 46
 
-record :: forall m. PrimMonad m => Parser m Record
-record = Parser $ \marr -> do
-  r <- Record
-    <$> srcAddr marr
-    <*> dstAddr marr
-    <*> nextHop marr
-    <*> input marr
-    <*> output marr
-    <*> dPkts marr
-    <*> dOctets marr
-    <*> firstSysUptime marr
-    <*> lastSysUptime marr
-    <*> srcPort marr
-    <*> dstPort marr
-    <*> pad1 marr
-    <*> tcpFlags marr
-    <*> prot marr
-    <*> tos marr
-    <*> srcAs marr
-    <*> dstAs marr
-    <*> srcMask marr
-    <*> dstMask marr
-    <*> pad2 marr
-  pure (shift recordSize marr, r)
+record :: Parser Record
+record = do
+  (_, len) <- get
+  if len < recordSize
+    then throwError ParseError
+    else parseWithShift recordSize recordReader
 
+records :: Count -> Parser (Array Record)
+records (fromIntegral . getCount -> sz)
+  = fmap Exts.fromList $ replicateM sz record
+
+recordReader :: Reader s Record
+recordReader marr = Record
+  <$> srcAddr marr
+  <*> dstAddr marr
+  <*> nextHop marr
+  <*> input marr
+  <*> output marr
+  <*> dPkts marr
+  <*> dOctets marr
+  <*> firstSysUptime marr
+  <*> lastSysUptime marr
+  <*> srcPort marr
+  <*> dstPort marr
+  <*> pad1 marr
+  <*> tcpFlags marr
+  <*> prot marr
+  <*> tos marr
+  <*> srcAs marr
+  <*> dstAs marr
+  <*> srcMask marr
+  <*> dstMask marr
+  <*> pad2 marr
